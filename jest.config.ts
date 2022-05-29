@@ -1,3 +1,4 @@
+/* eslint-disable */
 const config = {
   displayName: 'ooxast',
   preset: '../../../jest.preset.js',
