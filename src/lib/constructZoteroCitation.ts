@@ -1,3 +1,4 @@
+import { VFile } from 'vfile'
 import { findRef } from './findRefInBib.js'
 import { Citation, CitationItem, ZoteroCitation, ZoteroProperties } from './types.js'
 import { Data as CSL } from 'csl-json'
@@ -6,6 +7,7 @@ export function constructZoteroCitation(
   curr: Citation,
   index: number,
   bibliography?: CSL[],
+  message?: VFile['message'],
 ): ZoteroCitation {
   const schema = 'https://github.com/citation-style-language/schema/raw/master/csl-citation.json'
 
@@ -23,7 +25,7 @@ export function constructZoteroCitation(
   }
 
   const zotCites = curr.citationItems.reduce((acc: CitationItem[], curr) => {
-    const betterCSL = findRef(curr, bibliography)
+    const betterCSL = curr // findRef(curr, bibliography)
 
     acc.push(betterCSL)
     return acc

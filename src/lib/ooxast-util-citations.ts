@@ -1,12 +1,11 @@
-import { visitParents } from 'unist-util-visit-parents'
+import { SKIP, visitParents } from 'unist-util-visit-parents'
 import { P, R, T, Text, Root } from 'ooxast'
 import { getPStyle } from 'ooxast-util-get-style'
 import { parseTextCite } from 'parse-text-cite'
 import { Node } from 'unist'
 import { convertElement, isElement } from 'xast-util-is-element'
-import { select } from 'xast-util-select'
+import { select, selectAll } from 'xast-util-select'
 import { toString } from 'xast-util-to-string'
-import { select as unistSelect } from 'unist-util-select'
 import { x } from 'xastscript'
 import { Data as CSL } from 'csl-json'
 import { CiteOutput, Citation, MendeleyCitation, ZoteroCitation } from './types.js'
@@ -17,6 +16,7 @@ import { constructZoteroCitation } from './constructZoteroCitation.js'
 
 const isInstrT = convertElement<T>('w:instrText')
 const isP = convertElement<P>('w:p')
+const isSdt = convertElement('w:sdt')
 
 export const citationTypesWithSuffixedForm = ['mendeley', 'zotero']
 export interface Options {
@@ -53,12 +53,27 @@ export function findCitations(tree: Node, vfile?: VFile, options?: Options): Roo
       return
     }
 
-    const kids = p.children
+    // Word's own citations are runs wrapped in a citation content control (`w:sdt` with
+    // `w:citation`): unwrap them so their text gets parsed like any other run.
+    const kids = p.children.flatMap((kid) =>
+      // The ooxast types don't list `w:sdt` as a paragraph child, but Word puts it there.
+      isSdt(kid as Node) && select('w\\:sdtPr > w\\:citation', kid)
+        ? ((select('w\\:sdtContent', kid)?.children ?? []) as typeof p.children)
+        : [kid],
+    )
     const runs: typeof kids = []
 
     let skipNext = false
 
-    for (const kid of kids) {
+    // loop over runs
+    for (let idx = 0; idx < kids.length; idx++) {
+      const kid = kids[idx]
+
+      if (!convertElement<R>('w:r')(kid)) {
+        runs.push(kid)
+        continue
+      }
+
       const instr = select('w\\:instrText', kid)
 
       // Check if this is a Mendeley/Zotero citation, because if so we should not try to parse it ourselves
@@ -68,15 +83,24 @@ export function findCitations(tree: Node, vfile?: VFile, options?: Options): Roo
         continue
       }
 
-      const t = select('w\\:t', kid)
-
-      // If either one of them don't have text, don't merge them ya dummy
-      if (!t) {
+      // Leave runs with drawings, pictures or text boxes alone: rebuilding them as text would
+      // drop the drawing (and a text box's text is stored twice, in mc:Choice and mc:Fallback).
+      if (select('w\\:drawing, w\\:pict, mc\\:AlternateContent', kid)) {
         runs.push(kid)
         continue
       }
 
-      const text = toString(t)
+      // A run can hold several w:t (e.g. around a w:lastRenderedPageBreak once reoff-clean has
+      // merged runs): take all of their text, not just the first.
+      const ts = selectAll('w\\:t', kid)
+
+      // If either one of them don't have text, don't merge them ya dummy
+      if (!ts.length) {
+        runs.push(kid)
+        continue
+      }
+
+      const text = ts.map((t) => toString(t)).join('')
 
       /**
        * We dont care about empty runs
@@ -96,13 +120,14 @@ export function findCitations(tree: Node, vfile?: VFile, options?: Options): Roo
         continue
       }
 
-      const sentences = text.split(/(?<=[.?!])\s+(?=[A-Z])/)
+      // split the sentences to improve parsing performance
+      const sentences = text.split(/(?<=[a-z)][.?!])\s+(?=[A-Z]\w)/)
+
       // re-add the spaces that were removed by the split
       const sentencesWithSpaces = sentences.map((s, i) => {
         if (i === sentences.length - 1) return s
         return `${s} `
       })
-      // const sentencesWithSpaces = [text]
 
       const rpr = select('w\\:rPr', kid)
       for (const sentence of sentencesWithSpaces) {
@@ -111,6 +136,16 @@ export function findCitations(tree: Node, vfile?: VFile, options?: Options): Roo
           const parsedCitation = parseTextCite(sentence, {
             log: options?.log,
           }) as CiteOutput
+
+          parsedCitation.forEach((item) => {
+            if (typeof item === 'string') {
+              return
+            }
+
+            if (item?.citationItems?.[0]?.prefix) {
+              console.log({ item })
+            }
+          })
 
           // if the sentence is not a citation, just add it to the runs
           if (parsedCitation.every((item) => typeof item === 'string')) {
@@ -172,6 +207,13 @@ export function findCitations(tree: Node, vfile?: VFile, options?: Options): Roo
           }, [])
           runs.push(...newNodes)
         } catch (e) {
+          vfile?.message(
+            `Text unsuccesfully parsed, treating it as non-cite.
+            Sentence: ${sentence}
+            Error: ${e}`,
+            kid,
+            'ooxast-util-citations',
+          )
           console.warn('Text unsuccesfully parsed, treating it as non-cite')
           console.warn(sentence)
           console.warn(e)
@@ -188,6 +230,7 @@ export function findCitations(tree: Node, vfile?: VFile, options?: Options): Roo
     }
 
     p.children = runs
+    return SKIP
   })
   return tree as Root
 }
@@ -204,6 +247,7 @@ export function constructCitation(
   type: string,
   index: number,
   bibliography?: CSL[],
+  message?: VFile['message'],
 ): { citation: MendeleyCitation | ZoteroCitation; instr: string } {
   switch (type) {
     case 'mendeley': {
@@ -215,7 +259,7 @@ export function constructCitation(
     }
     case 'zotero':
     default: {
-      const citation = constructZoteroCitation(curr, index, bibliography)
+      const citation = constructZoteroCitation(curr, index, bibliography, message)
       return {
         instr: `ADDIN ZOTERO_ITEM CSL_CITATION ${JSON.stringify(citation)}`,
         citation,
